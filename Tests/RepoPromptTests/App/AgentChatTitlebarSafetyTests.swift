@@ -43,6 +43,31 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             "Active workspace: Beta. Chat: T2 — Continued task"
         )
         XCTAssertNotEqual(switchedWorkspace.workspaceTitle, oneWorkspace.workspaceTitle)
+
+        let repeatedWorkspace = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: alpha,
+            workspaceCount: 2,
+            instanceNumber: 2,
+            chatTitle: "Alpha"
+        )
+        XCTAssertEqual(repeatedWorkspace.workspaceTitle, "Alpha (2)")
+        XCTAssertFalse(repeatedWorkspace.showsDistinctChatTitle)
+        XCTAssertEqual(repeatedWorkspace.accessibilityLabel, "Active workspace: Alpha (2)")
+
+        let longWorkspace = WorkspaceModel(
+            name: "A workspace name long enough to exercise titlebar truncation",
+            repoPaths: []
+        )
+        let longWorkspacePresentation = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: longWorkspace,
+            workspaceCount: 1,
+            instanceNumber: nil,
+            chatTitle: "Long-name chat"
+        )
+        XCTAssertEqual(
+            longWorkspacePresentation.workspaceTitle,
+            "A workspace name long enough to exercise titlebar truncation"
+        )
     }
 
     func testButtonPointerStandardAndAccessibilityActivationUseTargetAction() throws {
