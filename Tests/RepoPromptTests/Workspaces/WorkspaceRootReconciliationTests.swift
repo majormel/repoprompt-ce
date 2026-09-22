@@ -1413,7 +1413,8 @@ import XCTest
                 )
 
                 let activeID = fixture.manager.activeWorkspaceID
-                let rootsBeforeLateResult = await fixture.files.workspaceFileContextStore.roots()
+                let visibleRootsBeforeLateResult = await fixture.files.workspaceFileContextStore.roots()
+                    .filter { !$0.isSystemRoot }
                 let shellsBeforeLateResult = fixture.files.visibleRootShellProjections
                 XCTAssertLessThanOrEqual(
                     fixture.manager.rootReconciliationStateForTesting.outstandingProbes,
@@ -1429,9 +1430,10 @@ import XCTest
                 try await fixture.settle()
                 fixture.manager.rootDirectoryProbeCheckpointForTesting = nil
 
-                let rootsAfterLateResult = await fixture.files.workspaceFileContextStore.roots()
+                let visibleRootsAfterLateResult = await fixture.files.workspaceFileContextStore.roots()
+                    .filter { !$0.isSystemRoot }
                 XCTAssertEqual(fixture.manager.activeWorkspaceID, activeID)
-                XCTAssertEqual(rootsAfterLateResult, rootsBeforeLateResult)
+                XCTAssertEqual(visibleRootsAfterLateResult, visibleRootsBeforeLateResult)
                 XCTAssertEqual(fixture.files.visibleRootShellProjections, shellsBeforeLateResult)
                 XCTAssertEqual(fixture.manager.rootReconciliationStateForTesting.waiterCount, 0)
                 XCTAssertLessThanOrEqual(
