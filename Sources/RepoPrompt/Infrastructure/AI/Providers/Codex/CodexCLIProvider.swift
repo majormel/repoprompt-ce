@@ -80,6 +80,7 @@ final class CodexCLIProvider: AIProvider {
     }
 
     private let workingDirectory: String?
+    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
     private let enableDebugLogging: Bool
     private let defaultRequestTimeout: TimeInterval
     private let testRequestTimeout: TimeInterval
@@ -101,6 +102,7 @@ final class CodexCLIProvider: AIProvider {
 
     init(
         workingDirectory: String? = nil,
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         enableDebugLogging: Bool = false,
         defaultRequestTimeout: TimeInterval? = nil,
         testRequestTimeout: TimeInterval? = nil,
@@ -112,6 +114,7 @@ final class CodexCLIProvider: AIProvider {
         sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil
     ) {
         self.workingDirectory = workingDirectory
+        self.launchSnapshot = launchSnapshot
         self.enableDebugLogging = enableDebugLogging
         self.defaultRequestTimeout = defaultRequestTimeout ?? (45 * 60)
         self.testRequestTimeout = testRequestTimeout ?? 30
@@ -126,7 +129,7 @@ final class CodexCLIProvider: AIProvider {
         _ = logCollector
 
         // Ensure RepoPrompt MCP server entry exists before building overrides.
-        _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
+        _ = MCPIntegrationHelper.ensureCodexServerForDiscovery(launchSnapshot: launchSnapshot)
     }
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
@@ -911,18 +914,9 @@ final class CodexCLIProvider: AIProvider {
             preconditionFailure("CodexCLIProvider requires an app-server client when no custom session controller factory is provided.")
         }
 
-        let interactiveConfigOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
-        let options = CodexNativeSessionController.Options(
-            requestTimeout: requestTimeout,
-            configOverridesProvider: { interactiveConfigOverrides },
-            approvalPolicyProvider: { .never },
-            sandboxModeProvider: { .readOnly },
-            approvalReviewerProvider: { .user },
-            authTokensRefreshHandler: nil,
-            goalSupportEnabledProvider: { false },
-            reasoningSummariesEnabledProvider: { false },
-            memoriesEnabledProvider: { false },
-            computerUseEnabledProvider: { false }
+        let options = interactiveSessionOptions(
+            excludeServers: excludeServers,
+            requestTimeout: requestTimeout
         )
 
         return CodexNativeSessionController(
@@ -940,7 +934,7 @@ final class CodexCLIProvider: AIProvider {
 
     private func makeRequestAppServerClient() -> CodexAppServerClient? {
         guard sessionControllerFactory == nil else { return nil }
-        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient()
+        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient(launchSnapshot: launchSnapshot)
     }
 
     private func withActiveRequestAppServerClient<T>(
@@ -993,6 +987,25 @@ final class CodexCLIProvider: AIProvider {
             overrides[key] = value
         }
         return overrides
+    }
+
+    func interactiveSessionOptions(
+        excludeServers: Set<String>,
+        requestTimeout: TimeInterval
+    ) -> CodexNativeSessionController.Options {
+        let configOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
+        return CodexNativeSessionController.Options(
+            requestTimeout: requestTimeout,
+            configOverridesProvider: { configOverrides },
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            authTokensRefreshHandler: nil,
+            goalSupportEnabledProvider: { false },
+            reasoningSummariesEnabledProvider: { false },
+            memoriesEnabledProvider: { false },
+            computerUseEnabledProvider: { false }
+        )
     }
 
     private func appServerSelection(

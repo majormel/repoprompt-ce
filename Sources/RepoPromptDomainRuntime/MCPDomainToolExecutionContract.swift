@@ -59,11 +59,17 @@ package enum MCPToolExecutionContract: Equatable, Sendable {
 
 package enum MCPToolExecutionDispatchError: Error, Equatable, Sendable {
     case missingContract(toolName: String)
-    case structureSettlementBusy(windowID: Int, reason: MCPCodeStructureSettlementRegistry.BusyReason)
+    case structureSettlementBusy(windowID: Int, context: MCPCodeStructureSettlementRegistry.BusyContext)
     case structureSettlementWindowUnresolved
 }
 
 package enum MCPToolExecutionContractCatalog {
+    private static let promptExportContract = MCPToolExecutionContract.bounded(
+        deadline: MCPTimeoutPolicy.promptExportExecutionDeadline,
+        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+        cleanupDisposition: .forceDisconnect
+    )
+
     private static let workspaceSwitchContract = MCPToolExecutionContract.bounded(
         deadline: MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline,
         cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
@@ -105,7 +111,10 @@ package enum MCPToolExecutionContractCatalog {
 
         for toolName in [
             MCPWindowToolName.agentExplore,
-            MCPWindowToolName.agentRun
+            MCPWindowToolName.agentRun,
+            // `agent_session_link.wait` parks on an event, not a timer, for up to the shared agent
+            // wait maximum. A bounded dispatch deadline would sever it mid-wait.
+            MCPWindowToolName.agentSessionLink
         ] {
             result[toolName] = .lifecycleManagedCancellable
         }
@@ -139,6 +148,11 @@ package enum MCPToolExecutionContractCatalog {
         arguments: [String: Value]
     ) -> MCPToolExecutionContract? {
         guard let baseContract = contract(for: toolName) else { return nil }
+        if [MCPWindowToolName.prompt, MCPWindowToolName.workspaceContext].contains(toolName),
+           MCPPromptContextOperation.parse(toolName: toolName, arguments: arguments) == .export
+        {
+            return promptExportContract
+        }
         if toolName == MCPWindowToolName.fileActions,
            arguments["action"]?.stringValue?
            .trimmingCharacters(in: .whitespacesAndNewlines)

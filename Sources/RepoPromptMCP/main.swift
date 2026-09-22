@@ -10,7 +10,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.3.0"
+let CLI_VERSION = "1.4.1"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -2553,8 +2553,8 @@ private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
 }
 
 /// Parses command line arguments to determine CLI mode
-func parseCLIMode() -> CLIMode {
-    let args = CommandLine.arguments.dropFirst() // Skip executable name
+func parseCLIMode(arguments: [String] = CommandLine.arguments) -> CLIMode {
+    let args = arguments.dropFirst() // Skip executable name
     var hasNonBackendUserArgs = false
     if args.first == "policy" {
         return .policyAdministration(Array(args.dropFirst()))
@@ -2797,12 +2797,14 @@ func parseCLIMode() -> CLIMode {
         case "--tab", "-t":
             i = args.index(after: i)
             if i < args.endIndex {
+                interactiveOptions.tabID = args[i]
                 execOptions.tabID = args[i]
             }
 
         case "--context-id":
             i = args.index(after: i)
             if i < args.endIndex {
+                interactiveOptions.contextID = args[i]
                 execOptions.contextID = args[i]
             }
 
@@ -3108,7 +3110,7 @@ func printUsage() {
           agent_run op=start message="Read the plan at prompt-exports/oracle-plan.md with read_file first. Implement item 1."
           agent_run op=wait session_id="<uuid>"        Block until input/terminal
           agent_run op=wait session_id="<uuid>" timeout=5  Bounded wait (seconds)
-          agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60
+          agent_run op=wait session_ids=["<uuid1>","<uuid2>"]
                                                         Wait for first of multiple sessions
           agent_run op=poll session_id="<uuid>"        Poll current snapshot
           agent_run op=poll session_ids=["<uuid1>","<uuid2>","<uuid3>"]
@@ -3117,8 +3119,10 @@ func printUsage() {
           agent_run op=respond session_id="<uuid>" interaction_id="<id>" response="accept"
           agent_run op=cancel session_id="<uuid>"      Cancel run
           Operations: start, poll, wait, cancel, steer, respond
-          wait accepts optional timeout (seconds, fractional OK). Defaults
-          to 300s (5 min). timeout=0 returns current snapshot immediately.
+          wait accepts optional timeout (seconds, fractional OK). Omit it for
+          the default; use shorter waits for closer supervision or longer waits
+          for well-scoped independent work. timeout=0 returns the current snapshot
+          immediately.
           session_ids is accepted only for wait/poll and is mutually exclusive
           with session_id. Multi-wait returns the winning snapshot plus wait
           metadata (mode, result, winner_session_id, pending_session_ids).
@@ -3424,8 +3428,8 @@ func printVersion() {
     print("\(cliDisplayCommand()) (repoprompt-mcp) \(CLI_VERSION)")
 }
 
-private let repoPromptCEReleaseBundleIdentifier = "com.pvncher.repoprompt.ce"
-private let repoPromptCEDebugBundleIdentifier = "com.pvncher.repoprompt.ce.debug"
+private let repoPromptCEReleaseBundleIdentifier = "com.repoprompt.ce"
+private let repoPromptCEDebugBundleIdentifier = "com.repoprompt.ce.debug"
 private let repoPromptCEBundleIdentifier: String = {
     #if DEBUG
         return repoPromptCEDebugBundleIdentifier

@@ -10,6 +10,10 @@ actor DirectHeadlessChildEndpoint {
         let clientPrincipal: String
         let providerIdentifier: String
         let runID: UUID
+        let launchID: UUID?
+        let oracleGroupID: OracleGroupID?
+        let oracleLaneID: OracleLaneID?
+        let oracleGroupClaimID: UUID?
     }
 
     enum EndpointError: Error, Equatable {
@@ -248,44 +252,122 @@ actor DirectHeadlessChildLaunchCoordinator {
 
     private var runtime: MCPDomainRuntime?
     private var harness: DomainPrivateChildLaunchHarness?
+    private var oracleAdapter: DirectHeadlessOracleAdapter?
 
-    func configure(runtime: MCPDomainRuntime, endpointDescriptor: String) {
+    func configure(
+        runtime: MCPDomainRuntime,
+        endpointDescriptor: String,
+        oracleAdapter: DirectHeadlessOracleAdapter
+    ) {
         self.runtime = runtime
+        self.oracleAdapter = oracleAdapter
         harness = DomainPrivateChildLaunchHarness(
             endpointDescriptor: endpointDescriptor,
             credentialStore: runtime.credentialEnvelopeStore,
             issueLaunchToken: { request in
                 try await runtime.routingCoordinator.issueLaunchToken(request)
+            },
+            revokeLaunchToken: { tokenID in
+                await runtime.routingCoordinator.revokeLaunchToken(tokenID)
             }
         )
     }
 
-    func prepare(
+    func resolvePlan(
         toolName: String,
         arguments: [String: MCP.Value],
         securityContext: DomainToolInvocationSecurityContext
-    ) async throws -> DomainChildLaunchCarrier? {
+    ) async throws -> DomainChildLaunchPlan {
+        guard runtime != nil, let oracleAdapter else { throw CoordinatorError.unavailable }
+        if ["ask_oracle", "oracle_send", "context_builder"].contains(toolName) {
+            return try await oracleAdapter.resolveChildLaunchPlan(
+                toolName: toolName,
+                arguments: arguments,
+                securityContext: securityContext
+            )
+        }
+        let provider = arguments["provider"]?.stringValue
+            ?? arguments["model_id"]?.stringValue
+            ?? arguments["agent"]?.stringValue
+            ?? "headless"
+        let runID = Self.resolvedRunID(
+            toolName: toolName,
+            arguments: arguments,
+            securityContext: securityContext
+        )
+        return try DomainChildLaunchPlan(
+            runID: runID,
+            lanes: [DomainChildLaunchLanePlan(providerIdentifier: provider)]
+        )
+    }
+
+    func prepare(
+        plan: DomainChildLaunchPlan,
+        toolName: String,
+        arguments: [String: MCP.Value],
+        securityContext: DomainToolInvocationSecurityContext
+    ) async throws -> DomainChildLaunchCarrierBundle {
         guard let runtime, let harness else { throw CoordinatorError.unavailable }
         let registration = try await runtime.routingCoordinator.currentRegistration(
             connectionID: securityContext.connectionID
         )
         let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
-        let provider = arguments["provider"]?.stringValue
-            ?? arguments["model_id"]?.stringValue
-            ?? "headless"
-        let runID = arguments["run_id"]?.stringValue.flatMap(UUID.init(uuidString:)) ?? UUID()
-        let request = DomainRunLaunchReservationRequest(
-            runID: runID,
-            context: handle.context,
-            expectedContextRevision: handle.contextRevision,
-            windowID: nil,
-            clientPrincipal: securityContext.principal.stableKey ?? securityContext.principal.displayName,
-            providerIdentifier: provider,
-            runPurpose: toolName,
-            additionalTools: Set(arguments["additional_tools"]?.arrayValue?.compactMap(\.stringValue) ?? []),
-            expectedProcessID: nil,
-            lifetime: .seconds(60)
-        )
-        return try await harness.prepare(request: request)
+        var carriers: [DomainChildLaunchCarrier] = []
+        do {
+            for lane in plan.lanes {
+                let request = DomainRunLaunchReservationRequest(
+                    runID: plan.runID,
+                    launchID: lane.launchID,
+                    oracleGroupID: plan.oracleGroupID,
+                    oracleLaneID: lane.oracleLaneID,
+                    oracleGroupClaimID: plan.oracleGroupClaimID,
+                    context: handle.context,
+                    expectedContextRevision: handle.contextRevision,
+                    windowID: nil,
+                    clientPrincipal: securityContext.principal.stableKey ?? securityContext.principal.displayName,
+                    providerIdentifier: lane.providerIdentifier,
+                    runPurpose: toolName,
+                    additionalTools: Set(arguments["additional_tools"]?.arrayValue?.compactMap(\.stringValue) ?? []),
+                    expectedProcessID: nil,
+                    lifetime: .seconds(60)
+                )
+                try await carriers.append(harness.prepare(request: request))
+            }
+            return try DomainChildLaunchCarrierBundle(plan: plan, carriers: carriers)
+        } catch {
+            for carrier in carriers {
+                await runtime.routingCoordinator.revokeLaunchToken(carrier.launchTokenID)
+                if let envelopeID = carrier.credentialEnvelope?.envelopeID {
+                    await runtime.credentialEnvelopeStore.revoke(envelopeID)
+                }
+            }
+            throw error
+        }
+    }
+
+    func revoke(plan: DomainChildLaunchPlan, bundle: DomainChildLaunchCarrierBundle?) async {
+        if let runtime {
+            for carrier in bundle?.carriers ?? [] {
+                await runtime.routingCoordinator.revokeLaunchToken(carrier.launchTokenID)
+                if let envelopeID = carrier.credentialEnvelope?.envelopeID {
+                    await runtime.credentialEnvelopeStore.revoke(envelopeID)
+                }
+            }
+        }
+        await oracleAdapter?.discardPreparedInvocation(plan: plan)
+    }
+
+    nonisolated static func resolvedRunID(
+        toolName: String,
+        arguments: [String: MCP.Value],
+        securityContext: DomainToolInvocationSecurityContext
+    ) -> UUID {
+        let operation = arguments["op"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let createsSession = (toolName == "agent_run" && (operation ?? "start") == "start")
+            || (toolName == "agent_explore" && operation == "start")
+        if createsSession { return UUID() }
+        return securityContext.principal.runID ?? UUID()
     }
 }

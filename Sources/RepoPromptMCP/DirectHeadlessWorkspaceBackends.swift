@@ -2,29 +2,6 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
-private extension DomainSettingValue {
-    init(mcpValue: Value) throws {
-        switch mcpValue {
-        case let .bool(value): self = .bool(value)
-        case let .int(value): self = .integer(value)
-        case let .double(value): self = .number(value)
-        case let .string(value): self = .string(value)
-        case .null: self = .null
-        default: throw MCPError.invalidParams("setting value must be a boolean, integer, number, string, or null")
-        }
-    }
-
-    var mcpValue: Value {
-        switch self {
-        case let .bool(value): .bool(value)
-        case let .integer(value): .int(value)
-        case let .number(value): .double(value)
-        case let .string(value): .string(value)
-        case .null: .null
-        }
-    }
-}
-
 actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
     private let runtime: MCPDomainRuntime
     private let scopeID: DomainStandaloneScopeID
@@ -94,7 +71,9 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             guard let key = args["key"]?.stringValue, let value = args["value"] else {
                 throw MCPError.invalidParams("set requires key and value")
             }
-            let domainValue = try DomainSettingValue(mcpValue: value)
+            guard let domainValue = DomainSettingValue(mcpValue: value) else {
+                throw MCPError.invalidParams("setting value must be a boolean, integer, number, string, string array, or null")
+            }
             let revision = try await settingsStore.set(key: key, value: domainValue)
             return try await .object([
                 "key": .string(key),
@@ -160,6 +139,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             } else {
                 throw MCPError.invalidParams("headless bind requires context_id or working_dirs")
             }
+            try await context.validateBinding(identity)
             let snapshot = try await runtime.standaloneScopeCoordinator.bind(scopeID: scopeID, context: identity)
             return try .object(["binding": bindingValue(snapshot.binding), "backend": .string("headless")])
         default:
@@ -194,6 +174,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             else {
                 throw MCPError.invalidParams("workspace has no contexts")
             }
+            try await context.validateBinding(chosen.metadata.identity)
             let snapshot = try await runtime.standaloneScopeCoordinator.bind(
                 scopeID: scopeID,
                 context: chosen.metadata.identity
@@ -258,6 +239,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             let fileURL = runtime.configuration.workspaceStorageDirectory
                 .appendingPathComponent("\(workspaceID.uuidString).json", isDirectory: false)
             let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
+            try await context.validateWorkspaceRoots(document.metadata.repoPaths)
             try await MCPDomainMutationCommitContext.willCommit()
             let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
                 operationID: operationID,
@@ -395,6 +377,9 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             documentBytes: bytes,
             fileURL: workspace.document.fileURL
         )
+        if action == "add_folder" || action == "remove_folder" || selectedContextID != nil {
+            try await context.validateWorkspaceRoots(replacement.metadata.repoPaths)
+        }
         try await MCPDomainMutationCommitContext.willCommit()
         let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
             operationID: operationID,

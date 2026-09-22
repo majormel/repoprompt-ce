@@ -4,6 +4,24 @@ import RepoPromptDomainRuntime
 import RepoPromptShared
 
 actor DirectHeadlessProviderCoordinator {
+    typealias BeginEpoch = @Sendable (
+        _ registration: DomainAgentSessionRegistration,
+        _ activationID: UUID
+    ) async -> DomainAgentRunSessionStore.EpochBeginResult
+
+    enum ExecutionPurpose {
+        case directOracle
+        case oracleGroup
+        case agent
+
+        var sandbox: String {
+            switch self {
+            case .oracleGroup: "read-only"
+            case .directOracle, .agent: "workspace-write"
+            }
+        }
+    }
+
     struct ProviderDescriptor {
         let id: String
         let displayName: String
@@ -27,13 +45,21 @@ actor DirectHeadlessProviderCoordinator {
         let agentID: String
         let model: String?
         var name: String?
-        var latestText: String?
+        let parentSessionID: UUID?
+        let worktreeBindings: [DomainAgentRunSnapshot.WorktreeBinding]
+        var latestSnapshot: DomainAgentRunSnapshot?
         var task: Task<Void, Never>?
+    }
+
+    struct ConversationReference: Equatable {
+        let id: UUID
+        let updatedAt: Date
     }
 
     private struct Conversation {
         let id: UUID
         let providerID: String
+        let model: String?
         var messages: [(role: String, text: String)]
         var updatedAt: Date
     }
@@ -42,7 +68,9 @@ actor DirectHeadlessProviderCoordinator {
     private let context: DirectHeadlessDomainContext
     private let settingsStore: DomainDirectSettingsStore
     private let environment: [String: String]
+    private let beginEpoch: BeginEpoch
     private var agents: [UUID: AgentRecord] = [:]
+    private var providerTasks: [UUID: Task<String, Error>] = [:]
     private var conversations: [UUID: Conversation] = [:]
     private var isShuttingDown = false
 
@@ -50,12 +78,22 @@ actor DirectHeadlessProviderCoordinator {
         runtime: MCPDomainRuntime,
         context: DirectHeadlessDomainContext,
         settingsStore: DomainDirectSettingsStore,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        beginEpoch: BeginEpoch? = nil
     ) {
         self.runtime = runtime
         self.context = context
         self.settingsStore = settingsStore
         self.environment = environment
+        let sessionStore = runtime.agentSessionStore
+        self.beginEpoch = beginEpoch ?? { registration, activationID in
+            await sessionStore.beginEpoch(
+                registration: registration,
+                activationID: activationID,
+                expectedCurrentEpoch: nil,
+                transitionKind: .initial
+            )
+        }
     }
 
     func providerCatalog() -> [ProviderDescriptor] {
@@ -73,13 +111,24 @@ actor DirectHeadlessProviderCoordinator {
         ]
     }
 
-    static func codexExecArguments(model: String?) -> [String] {
+    static func codexExecArguments(model: String?, purpose: ExecutionPurpose) -> [String] {
         var arguments: [String] = []
         if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
             arguments += ["--model", model]
         }
-        arguments += ["exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        arguments += ["exec", "--skip-git-repo-check", "--sandbox", purpose.sandbox, "--json", "-"]
         return arguments
+    }
+
+    func validateOracleRoster(_ roster: OracleRoster) throws {
+        for model in roster.orderedModels {
+            let descriptor = try resolveProvider(model.providerID)
+            guard descriptor.executable != nil else {
+                throw MCPError.invalidRequest(
+                    "Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")"
+                )
+            }
+        }
     }
 
     func runProviderOnce(
@@ -87,6 +136,8 @@ actor DirectHeadlessProviderCoordinator {
         providerID: String?,
         model: String?,
         request: DomainPhysicalToolRequest,
+        sessionID: UUID? = nil,
+        purpose: ExecutionPurpose,
         carrierEnvironment: [String: String]? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
@@ -94,19 +145,38 @@ actor DirectHeadlessProviderCoordinator {
         guard let executable = descriptor.executable else {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
         }
-        let snapshot = try await context.snapshot(for: request)
-        let arguments = Self.codexExecArguments(model: model)
+        guard let connectionID = request.securityContext?.connectionID else {
+            throw DirectHeadlessDomainContext.Error.routingUnavailable
+        }
+        let effectiveSessionID = sessionID ?? request.securityContext?.principal.runID
+        let snapshot = try await context.snapshot(
+            connectionID: connectionID,
+            sessionID: effectiveSessionID
+        )
+        guard !isShuttingDown else { throw CancellationError() }
+        try Task.checkCancellation()
+        let arguments = Self.codexExecArguments(model: model, purpose: purpose)
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }
-        let output = try await DirectProcess.run(
-            executable,
-            arguments: arguments,
-            input: Data(message.utf8),
-            environment: childEnvironment,
-            currentDirectory: snapshot.roots.first
-        )
-        return Self.finalAssistantText(from: output)
+        let taskID = UUID()
+        let task = Task {
+            let output = try await DirectProcess.run(
+                executable,
+                arguments: arguments,
+                input: Data(message.utf8),
+                environment: childEnvironment,
+                currentDirectory: snapshot.activeRoot
+            )
+            return Self.finalAssistantText(from: output)
+        }
+        providerTasks[taskID] = task
+        defer { providerTasks.removeValue(forKey: taskID) }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     func startAgent(args: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
@@ -129,20 +199,34 @@ actor DirectHeadlessProviderCoordinator {
         }
         let sessionID = DomainChildLaunchContext.current?.runID ?? UUID()
         let runID = sessionID
+        guard let connectionID = request.securityContext?.connectionID else {
+            throw DirectHeadlessDomainContext.Error.routingUnavailable
+        }
+        let requestedParentSessionID = request.securityContext?.principal.runID
+        let parentSessionID = requestedParentSessionID.flatMap { agents[$0] == nil ? nil : $0 }
+        let rootOverlayPreparation = try await context.prepareSessionRootOverlay(
+            sessionID: sessionID,
+            sourceSessionID: parentSessionID,
+            arguments: args,
+            connectionID: connectionID
+        )
         let registration = await runtime.agentSessionStore.register(sessionID: sessionID)
         let activationID = UUID()
         let epoch: DomainAgentRunTurnEpoch
-        switch await runtime.agentSessionStore.beginEpoch(
-            registration: registration,
-            activationID: activationID,
-            expectedCurrentEpoch: nil,
-            transitionKind: .initial
-        ) {
+        switch await beginEpoch(registration, activationID) {
         case let .accepted(value): epoch = value
-        case let .rejected(reason): throw MCPError.internalError(reason)
-        case .stale: throw MCPError.internalError("agent epoch changed during start")
+        case let .rejected(reason):
+            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
+            await runtime.agentSessionStore.cleanup(registration: registration)
+            throw MCPError.internalError(reason)
+        case .stale:
+            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
+            await runtime.agentSessionStore.cleanup(registration: registration)
+            throw MCPError.internalError("agent epoch changed during start")
         }
         let name = args["session_name"]?.stringValue
+        guard !isShuttingDown else { throw CancellationError() }
+        try Task.checkCancellation()
         let record = AgentRecord(
             registration: registration,
             epoch: epoch,
@@ -150,17 +234,21 @@ actor DirectHeadlessProviderCoordinator {
             agentID: descriptor.id,
             model: args["model"]?.stringValue,
             name: name,
-            latestText: nil,
+            parentSessionID: parentSessionID,
+            worktreeBindings: rootOverlayPreparation.bindings,
+            latestSnapshot: nil,
             task: nil
         )
-        agents[sessionID] = record
+        var runningRecord = record
         let running = snapshot(
-            record: record,
+            record: runningRecord,
             status: .running,
             statusText: "Running",
             assistantText: nil,
             failure: nil
         )
+        runningRecord.latestSnapshot = running
+        agents[sessionID] = runningRecord
         await runtime.agentSessionStore.noteSnapshot(
             running,
             cursor: DomainAgentSessionWaitCursor(registration: registration, epoch: epoch)
@@ -170,14 +258,21 @@ actor DirectHeadlessProviderCoordinator {
         let task = Task { [weak self] in
             guard let self else { return }
             let report = await DomainAgentRunExecutionCore.execute {
-                let text = try await runProviderOnce(
-                    message: message,
-                    providerID: descriptor.id,
-                    model: args["model"]?.stringValue,
-                    request: capturedRequest,
-                    carrierEnvironment: capturedCarrierEnvironment
-                )
-                return .completed(assistantText: text)
+                do {
+                    let text = try await runProviderOnce(
+                        message: message,
+                        providerID: descriptor.id,
+                        model: args["model"]?.stringValue,
+                        request: capturedRequest,
+                        sessionID: sessionID,
+                        purpose: .agent,
+                        carrierEnvironment: capturedCarrierEnvironment
+                    )
+                    return .completed(assistantText: text)
+                } catch {
+                    if Task.isCancelled { throw CancellationError() }
+                    throw error
+                }
             }
             guard case let .terminal(outcome) = report.result else { return }
             await finishAgent(sessionID: sessionID, outcome: outcome)
@@ -200,7 +295,7 @@ actor DirectHeadlessProviderCoordinator {
         }
         if timeout <= 0 {
             return await runtime.agentSessionStore.snapshot(for: record.registration)
-                ?? DomainAgentRunSnapshot.expired(sessionID: sessionID)
+                ?? retainedSnapshot(record)
         }
         return await waitAgent(sessionID: sessionID, timeout: timeout)
     }
@@ -218,15 +313,15 @@ actor DirectHeadlessProviderCoordinator {
             return wake.snapshot
         case .timedOut:
             return await runtime.agentSessionStore.snapshot(for: record.registration)
-                ?? DomainAgentRunSnapshot.expired(sessionID: sessionID, statusText: "wait timed out")
+                ?? retainedSnapshot(record)
         case .cancelled:
             return DomainAgentRunSnapshot.expired(sessionID: sessionID, statusText: "wait cancelled")
         case .expired:
-            return DomainAgentRunSnapshot.expired(sessionID: sessionID)
+            return retainedSnapshot(record)
         case let .epochAdvanced(epoch, _):
             return await runtime.agentSessionStore.snapshot(
                 for: DomainAgentSessionWaitCursor(registration: record.registration, epoch: epoch)
-            ) ?? DomainAgentRunSnapshot.expired(sessionID: sessionID)
+            ) ?? retainedSnapshot(record)
         case let .terminalPublicationRejected(_, reason):
             return DomainAgentRunSnapshot.expired(sessionID: sessionID, statusText: reason)
         }
@@ -237,9 +332,11 @@ actor DirectHeadlessProviderCoordinator {
     }
 
     func listAgents() async -> [Value] {
-        var values = agents.values.map { record -> Value in
-            let current = awaitSnapshot(record)
-            return current.toValue()
+        var values: [Value] = []
+        for record in agents.values {
+            let current = await runtime.agentSessionStore.snapshot(for: record.registration)
+                ?? retainedSnapshot(record)
+            values.append(current.toValue())
         }
         let activeIDs = Set(agents.keys)
         for metadata in await runtime.agentSessionStore.restoredMetadata() where !activeIDs.contains(metadata.sessionID) {
@@ -255,9 +352,18 @@ actor DirectHeadlessProviderCoordinator {
 
     func updateStatus(sessionID: UUID, name: String?) async throws -> Value {
         guard var record = agents[sessionID] else { throw MCPError.invalidParams("unknown session_id") }
+        let previous = await runtime.agentSessionStore.snapshot(for: record.registration)
+            ?? retainedSnapshot(record)
         record.name = name
+        let current = snapshot(
+            record: record,
+            status: previous.status,
+            statusText: previous.statusText,
+            assistantText: previous.latestAssistantPreview,
+            failure: previous.failureReason
+        )
+        record.latestSnapshot = current
         agents[sessionID] = record
-        let current = awaitSnapshot(record)
         await runtime.agentSessionStore.noteSnapshot(
             current,
             cursor: DomainAgentSessionWaitCursor(registration: record.registration, epoch: record.epoch)
@@ -267,9 +373,9 @@ actor DirectHeadlessProviderCoordinator {
 
     func shareThoughts(sessionID: UUID, text: String) async throws -> Value {
         guard var record = agents[sessionID] else { throw MCPError.invalidParams("unknown session_id") }
-        record.latestText = text
-        agents[sessionID] = record
         let current = snapshot(record: record, status: .waitingForInput, statusText: "Thoughts shared", assistantText: text, failure: nil)
+        record.latestSnapshot = current
+        agents[sessionID] = record
         await runtime.agentSessionStore.noteSnapshotAndWakeWaiters(
             current,
             cursor: DomainAgentSessionWaitCursor(registration: record.registration, epoch: record.epoch),
@@ -278,28 +384,47 @@ actor DirectHeadlessProviderCoordinator {
         return current.toValue()
     }
 
-    func createConversation(providerID: String?, message: String, model: String?, request: DomainPhysicalToolRequest) async throws -> (UUID, String) {
+    func createConversation(
+        providerID: String?,
+        message: String,
+        model: String?,
+        request: DomainPhysicalToolRequest
+    ) async throws -> (UUID, String) {
         let descriptor = try resolveProvider(providerID)
-        let text = try await runProviderOnce(message: message, providerID: descriptor.id, model: model, request: request)
+        let text = try await runProviderOnce(
+            message: message,
+            providerID: descriptor.id,
+            model: model,
+            request: request,
+            purpose: .directOracle
+        )
         let id = UUID()
         conversations[id] = Conversation(
             id: id,
             providerID: descriptor.id,
+            model: model,
             messages: [("user", message), ("assistant", text)],
             updatedAt: Date()
         )
         return (id, text)
     }
 
-    func continueConversation(id: UUID, message: String, model: String?, request: DomainPhysicalToolRequest) async throws -> String {
-        guard var conversation = conversations[id] else { throw MCPError.invalidParams("unknown chat_id") }
+    func continueConversation(
+        id: UUID,
+        message: String,
+        request: DomainPhysicalToolRequest
+    ) async throws -> String {
+        guard var conversation = conversations[id] else {
+            throw MCPError.invalidParams("unknown chat_id")
+        }
         let history = conversation.messages.map { "\($0.role): \($0.text)" }.joined(separator: "\n\n")
         let prompt = history + "\n\nuser: " + message
         let text = try await runProviderOnce(
             message: prompt,
             providerID: conversation.providerID,
-            model: model,
-            request: request
+            model: conversation.model,
+            request: request,
+            purpose: .directOracle
         )
         conversation.messages.append(("user", message))
         conversation.messages.append(("assistant", text))
@@ -311,10 +436,12 @@ actor DirectHeadlessProviderCoordinator {
     func conversationLog(id: UUID?, limit: Int) throws -> Value {
         let conversation: Conversation
         if let id {
-            guard let found = conversations[id] else { throw MCPError.invalidParams("unknown chat_id") }
+            guard let found = conversations[id] else {
+                throw MCPError.invalidParams("unknown chat_id")
+            }
             conversation = found
         } else {
-            guard let latest = conversations.values.max(by: { $0.updatedAt < $1.updatedAt }) else {
+            guard let latest = latestConversation() else {
                 return .object(["messages": .array([])])
             }
             conversation = latest
@@ -328,15 +455,36 @@ actor DirectHeadlessProviderCoordinator {
         ])
     }
 
+    func latestConversationReference() -> ConversationReference? {
+        latestConversation().map { ConversationReference(id: $0.id, updatedAt: $0.updatedAt) }
+    }
+
+    private func latestConversation() -> Conversation? {
+        conversations.values.max { lhs, rhs in
+            if lhs.updatedAt == rhs.updatedAt {
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            return lhs.updatedAt < rhs.updatedAt
+        }
+    }
+
     func shutdown() async {
         isShuttingDown = true
-        let tasks = agents.values.compactMap(\.task)
-        for task in tasks {
+        let agentTasks = agents.values.compactMap(\.task)
+        let physicalTasks = Array(providerTasks.values)
+        for task in agentTasks {
             task.cancel()
         }
-        for task in tasks {
+        for task in physicalTasks {
+            task.cancel()
+        }
+        for task in agentTasks {
             await task.value
         }
+        for task in physicalTasks {
+            _ = try? await task.value
+        }
+        providerTasks.removeAll()
     }
 
     /// Settles one agent run through the neutral terminal-outcome contract.
@@ -347,9 +495,7 @@ actor DirectHeadlessProviderCoordinator {
         outcome: DomainAgentRunTerminalOutcome
     ) async {
         guard var record = agents[sessionID] else { return }
-        record.latestText = outcome.assistantText
         record.task = nil
-        agents[sessionID] = record
         let terminal = snapshot(
             record: record,
             status: outcome.snapshotStatus,
@@ -357,6 +503,8 @@ actor DirectHeadlessProviderCoordinator {
             assistantText: outcome.assistantText,
             failure: outcome.failureReason
         )
+        record.latestSnapshot = terminal
+        agents[sessionID] = record
         _ = await runtime.agentSessionStore.publishTerminal(
             DomainAgentRunTerminalPublicationEnvelope(epoch: record.epoch, snapshot: terminal),
             registration: record.registration,
@@ -365,12 +513,12 @@ actor DirectHeadlessProviderCoordinator {
         )
     }
 
-    private func awaitSnapshot(_ record: AgentRecord) -> DomainAgentRunSnapshot {
-        snapshot(
+    private func retainedSnapshot(_ record: AgentRecord) -> DomainAgentRunSnapshot {
+        record.latestSnapshot ?? snapshot(
             record: record,
-            status: record.task == nil ? .completed : .running,
-            statusText: record.task == nil ? "Completed" : "Running",
-            assistantText: record.latestText,
+            status: .running,
+            statusText: "Running",
+            assistantText: nil,
             failure: nil
         )
     }
@@ -397,9 +545,9 @@ actor DirectHeadlessProviderCoordinator {
             interaction: nil,
             transcriptItemCount: assistantText == nil ? 0 : 1,
             updatedAt: Date(),
-            parentSessionID: nil,
+            parentSessionID: record.parentSessionID,
             failureReason: failure,
-            worktreeBindings: [],
+            worktreeBindings: record.worktreeBindings,
             activeWorktreeMerges: []
         )
     }
@@ -430,6 +578,9 @@ actor DirectHeadlessProviderCoordinator {
         args: [String: Value],
         includeSessionCleanupGuidance: Bool = true
     ) throws -> String {
+        if let parameters = args["model_parameters"], parameters != .null, parameters != .array([]) {
+            throw MCPError.invalidParams("model_parameters are supported only for app-backed Cursor sessions.")
+        }
         guard let message = args["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
             throw MCPError.invalidParams("agent_run start requires message")
         }

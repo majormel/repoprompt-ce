@@ -25,6 +25,7 @@ extension AgentModeViewModel {
         let filteredTabs: [StashedTab]
         let sortedTabs: [StashedTab]
         let dateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
+        let sessionIDByStashedTabID: [UUID: UUID]
     }
 
     struct ArchivedHUDSessionDescriptor {
@@ -32,6 +33,11 @@ extension AgentModeViewModel {
         let entry: AgentSessionIndexEntry?
         let dateInfo: SidebarSessionDateInfo
         let searchFields: AgentSessionSearchFields
+    }
+
+    private struct ArchivedSidebarSessionMetadata {
+        let dateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
+        let sessionIDByStashedTabID: [UUID: UUID]
     }
 
     private struct ArchivedSidebarSessionLookup {
@@ -172,12 +178,40 @@ extension AgentModeViewModel {
         for stashedTab: StashedTab,
         lookup: ArchivedSidebarSessionLookup
     ) -> SidebarSessionDateInfo {
-        let entry = lookup.explicitEntry(for: stashedTab.tab.activeAgentSessionID)
-            ?? preferredArchivedSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, lookup: lookup)
+        archivedSessionDateInfo(
+            for: stashedTab,
+            entry: archivedSidebarEntry(for: stashedTab, lookup: lookup)
+        )
+    }
 
-        return SidebarSessionDateInfo(
+    private func archivedSessionDateInfo(
+        for stashedTab: StashedTab,
+        entry: AgentSessionIndexEntry?
+    ) -> SidebarSessionDateInfo {
+        SidebarSessionDateInfo(
             lastEngagementAt: entry?.lastUserMessageAt,
             activityDate: entry.map(AgentSessionRestoreSupport.sidebarActivityDate(for:)) ?? stashedTab.tab.lastModified
+        )
+    }
+
+    private func archivedSidebarSessionMetadata(
+        for stashedTabs: [StashedTab],
+        lookup: ArchivedSidebarSessionLookup
+    ) -> ArchivedSidebarSessionMetadata {
+        var dateInfoByStashedTabID: [UUID: SidebarSessionDateInfo] = [:]
+        var sessionIDByStashedTabID: [UUID: UUID] = [:]
+        dateInfoByStashedTabID.reserveCapacity(stashedTabs.count)
+        sessionIDByStashedTabID.reserveCapacity(stashedTabs.count)
+
+        for stashedTab in stashedTabs {
+            let entry = archivedSidebarEntry(for: stashedTab, lookup: lookup)
+            dateInfoByStashedTabID[stashedTab.id] = archivedSessionDateInfo(for: stashedTab, entry: entry)
+            sessionIDByStashedTabID[stashedTab.id] = stashedTab.tab.activeAgentSessionID ?? entry?.id
+        }
+
+        return ArchivedSidebarSessionMetadata(
+            dateInfoByStashedTabID: dateInfoByStashedTabID,
+            sessionIDByStashedTabID: sessionIDByStashedTabID
         )
     }
 
@@ -197,20 +231,22 @@ extension AgentModeViewModel {
             return ArchivedSidebarSessionTabsSnapshot(
                 filteredTabs: filteredTabs,
                 sortedTabs: [],
-                dateInfoByStashedTabID: [:]
+                dateInfoByStashedTabID: [:],
+                sessionIDByStashedTabID: [:]
             )
         }
-        let dateInfoByID = archivedSessionDateInfoByID(for: filteredTabs, lookup: lookup)
+        let metadata = archivedSidebarSessionMetadata(for: filteredTabs, lookup: lookup)
         let sortedTabs = sortedFilteredArchivedSessionTabs(
             filteredTabs,
             diagnosticInputStashedCount: stashedTabs.count,
             diagnosticSearchActive: !trimmedSearch.isEmpty,
-            dateInfoByID: dateInfoByID
+            dateInfoByID: metadata.dateInfoByStashedTabID
         )
         return ArchivedSidebarSessionTabsSnapshot(
             filteredTabs: filteredTabs,
             sortedTabs: sortedTabs,
-            dateInfoByStashedTabID: dateInfoByID
+            dateInfoByStashedTabID: metadata.dateInfoByStashedTabID,
+            sessionIDByStashedTabID: metadata.sessionIDByStashedTabID
         )
     }
 
@@ -554,6 +590,12 @@ extension AgentModeViewModel {
             return cached.projection
         }
 
+        let existingSelectionIdentities = Set(
+            composeTabs.map { AgentSidebarSelectionIdentity.active(tabID: $0.id) }
+                + stashedTabs.map {
+                    AgentSidebarSelectionIdentity.archived(stashedTabID: $0.id, tabID: $0.tab.id)
+                }
+        )
         let canonicalRows = buildSidebarSessions(
             for: composeTabs,
             workspaceID: workspaceID,
@@ -599,10 +641,12 @@ extension AgentModeViewModel {
             archivedSessionTabsForHeader: archivedSessionTabs.filteredTabs,
             pagedArchivedSessionTabsForRows: pagedArchivedTabs,
             archivedDateInfoByStashedTabID: archivedSessionTabs.dateInfoByStashedTabID,
+            archivedSessionIDByStashedTabID: archivedSessionTabs.sessionIDByStashedTabID,
             defaultCollapseSeedKeys: defaultCollapsedSidebarThreadKeys(
                 in: canonicalRows,
                 searchText: sidebarSnapshot.searchText
             ),
+            existingSelectionIdentities: existingSelectionIdentities,
             renderedSelectionOrder: renderedSelectionOrder
         )
         sidebarListProjectionCache = (key, projection)
@@ -690,6 +734,10 @@ extension AgentModeViewModel {
         let searchTrimmed = effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let result: [SidebarSession]
         if searchTrimmed.isEmpty {
+            // Search normalization is demand-driven. Release the last active
+            // query's materialized fields when search deactivates so a large
+            // workspace does not retain them indefinitely.
+            sidebarSearchFieldsMemo.removeAll(keepingCapacity: true)
             result = sidebarRowsApplyingThreadCollapse(
                 sortedSessions,
                 currentTabID: currentTabID,
@@ -707,14 +755,15 @@ extension AgentModeViewModel {
             )
 
             let query = AgentSessionSearchQuery.parse(searchTrimmed)
+            let materializedSearchFields = sidebarSearchFields(for: sortedSessions)
 
             // Collect direct matches and include their ancestor chain so matching
             // child sessions remain visible in threaded context. Do not inject
             // the active session unless it is an actual match; otherwise sidebar
             // search presents false positives for arbitrary queries.
             var matchedIDs = Set<UUID>()
-            for session in sortedSessions {
-                if AgentSessionSearchMatcher.matches(query: query, fields: session.searchFields) {
+            for (session, fields) in zip(sortedSessions, materializedSearchFields) {
+                if AgentSessionSearchMatcher.matches(query: query, fields: fields) {
                     matchedIDs.insert(session.id)
                     var cursor = session.parentSessionID
                     var visitedSessionIDs: Set<UUID> = []
@@ -884,6 +933,62 @@ extension AgentModeViewModel {
         return displayedRows
     }
 
+    /// Materializes normalized search fields for `rows`, reusing previously
+    /// materialized values whose source inputs are unchanged.
+    ///
+    /// Returns one entry per element of `rows`, positionally aligned, so callers
+    /// index the result by position rather than by row id. That keeps the lookup
+    /// total: there is no missing-key case, and therefore no uncounted fallback
+    /// that could bypass the memo and under-report the materialization counter.
+    ///
+    /// The memo is owned by this view model (main actor) and is replaced by the
+    /// current row set on every call, so it cannot outgrow the visible sidebar or
+    /// retain fields for rows that no longer exist.
+    func sidebarSearchFields(for rows: [SidebarSession]) -> [AgentSessionSearchFields] {
+        #if DEBUG
+            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+        #endif
+        var refreshed: [UUID: (source: AgentSessionSearchFieldSource, fields: AgentSessionSearchFields)] = [:]
+        refreshed.reserveCapacity(rows.count)
+        var result: [AgentSessionSearchFields] = []
+        result.reserveCapacity(rows.count)
+        var materializedCount = 0
+        for row in rows {
+            if let cached = sidebarSearchFieldsMemo[row.id], cached.source == row.searchFieldSource {
+                refreshed[row.id] = cached
+                result.append(cached.fields)
+                continue
+            }
+            let fields = row.makeSearchFields()
+            materializedCount += 1
+            #if DEBUG
+                test_sidebarSearchFieldsMaterializationCount &+= 1
+            #endif
+            refreshed[row.id] = (row.searchFieldSource, fields)
+            result.append(fields)
+        }
+        sidebarSearchFieldsMemo = refreshed
+        #if DEBUG
+            // Emitted only on the active-search path. Absence of this event while
+            // the sidebar is in use is the live signal that an inactive search box
+            // normalized nothing. Counts only — no titles, paths, or ids.
+            AgentModePerfDiagnostics.increment(
+                "sidebar.searchFields.materialized",
+                by: materializedCount
+            )
+            AgentModePerfDiagnostics.durationEvent(
+                "sidebar.searchFieldsMaterialize",
+                startMS: startMS,
+                fields: [
+                    "rowCount": String(rows.count),
+                    "materializedCount": String(materializedCount),
+                    "reusedCount": String(rows.count - materializedCount)
+                ]
+            )
+        #endif
+        return result
+    }
+
     private func sidebarThreadActivityDate(for row: SidebarSession) -> Date {
         row.lastUserMessageAt ?? row.activityDate
     }
@@ -917,7 +1022,7 @@ extension AgentModeViewModel {
             hiddenThreadDescendantCount: hiddenThreadDescendantCount,
             hiddenThreadDescendantAttentionCount: hiddenThreadDescendantAttentionCount,
             threadActivityDate: threadActivityDate,
-            searchFields: row.searchFields
+            searchFieldSource: row.searchFieldSource
         )
     }
 
