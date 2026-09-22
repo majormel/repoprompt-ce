@@ -48,7 +48,12 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             activeWorkspace: alpha,
             workspaceCount: 2,
             instanceNumber: 2,
-            chatTitle: "Alpha"
+            // The title cluster receives the resolved window title, including the instance suffix.
+            chatTitle: WindowTitleFormatter.compose(
+                workspaceTitle: "Alpha (2)",
+                agentSessionTitle: "Alpha",
+                duplicateWorkspaceTitle: alpha.name
+            )
         )
         XCTAssertEqual(repeatedWorkspace.workspaceTitle, "Alpha (2)")
         XCTAssertFalse(repeatedWorkspace.showsDistinctChatTitle)
