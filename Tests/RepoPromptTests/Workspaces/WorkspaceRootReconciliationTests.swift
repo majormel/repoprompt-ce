@@ -1413,8 +1413,7 @@ import XCTest
                 )
 
                 let activeID = fixture.manager.activeWorkspaceID
-                let visibleRootsBeforeLateResult = await fixture.files.workspaceFileContextStore.roots()
-                    .filter { !$0.isSystemRoot }
+                let rootsBeforeLateResult = await fixture.files.workspaceFileContextStore.roots()
                 let shellsBeforeLateResult = fixture.files.visibleRootShellProjections
                 XCTAssertLessThanOrEqual(
                     fixture.manager.rootReconciliationStateForTesting.outstandingProbes,
@@ -1430,10 +1429,13 @@ import XCTest
                 try await fixture.settle()
                 fixture.manager.rootDirectoryProbeCheckpointForTesting = nil
 
-                let visibleRootsAfterLateResult = await fixture.files.workspaceFileContextStore.roots()
-                    .filter { !$0.isSystemRoot }
+                let rootsAfterLateResult = await fixture.files.workspaceFileContextStore.roots()
                 XCTAssertEqual(fixture.manager.activeWorkspaceID, activeID)
-                XCTAssertEqual(visibleRootsAfterLateResult, visibleRootsBeforeLateResult)
+                XCTAssertEqual(
+                    rootsAfterLateResult.filter { !$0.isSystemRoot },
+                    rootsBeforeLateResult.filter { !$0.isSystemRoot },
+                    "The retired probe must not republish primary roots; the new workspace may finish installing system roots"
+                )
                 XCTAssertEqual(fixture.files.visibleRootShellProjections, shellsBeforeLateResult)
                 XCTAssertEqual(fixture.manager.rootReconciliationStateForTesting.waiterCount, 0)
                 XCTAssertLessThanOrEqual(
